@@ -1,0 +1,16 @@
+[package]
+name = "llama-metal"
+version = "0.1.0"
+edition = "2021"
+description = "Minimal llama.cpp wrapper with Metal GPU support for local LLM inference"
+license = "MIT"
+keywords = ["llm", "llama", "metal", "inference", "gpt"]
+categories = ["science", "api-bindings"]
+
+[dependencies]
+llama-cpp-2 = "0.1.88"
+tokio = { version = "1", features = ["sync", "rt"] }
+thiserror = "1.0"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }
