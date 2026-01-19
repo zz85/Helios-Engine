@@ -16,12 +16,30 @@ use uuid::Uuid;
 
 #[cfg(feature = "candle")]
 use {
-    candle_core::{quantized::gguf_file, Device},
+    candle_core::{quantized::gguf_file, Device, Tensor},
     candle_transformers::generation::LogitsProcessor,
+    candle_transformers::models::quantized_llama::ModelWeights as LlamaModel,
     candle_transformers::models::quantized_qwen2::ModelWeights as Qwen2Model,
     hf_hub::api::sync::Api,
     tokenizers::Tokenizer,
 };
+
+/// Enum to hold different model types
+#[cfg(feature = "candle")]
+pub enum ModelWrapper {
+    Llama(LlamaModel),
+    Qwen2(Qwen2Model),
+}
+
+#[cfg(feature = "candle")]
+impl ModelWrapper {
+    pub fn forward(&mut self, x: &Tensor, index_pos: usize) -> candle_core::Result<Tensor> {
+        match self {
+            ModelWrapper::Llama(m) => m.forward(x, index_pos),
+            ModelWrapper::Qwen2(m) => m.forward(x, index_pos),
+        }
+    }
+}
 
 /// Model type enumeration for supported architectures
 #[derive(Debug, Clone, PartialEq)]
@@ -128,7 +146,7 @@ pub struct CandleLLMProvider {
     #[cfg(feature = "candle")]
     tokenizer: Arc<Tokenizer>,
     #[cfg(feature = "candle")]
-    model: Arc<std::sync::Mutex<Qwen2Model>>,
+    model: Arc<std::sync::Mutex<ModelWrapper>>,
 }
 
 impl CandleLLMProvider {
@@ -146,11 +164,15 @@ impl CandleLLMProvider {
         {
             let model_type = ModelType::from_repo(&config.huggingface_repo);
 
-            // Determine device
+            // Determine device - try Metal first (macOS), then CUDA, then CPU
             let device = if config.use_gpu {
-                match Device::cuda_if_available(0) {
-                    Ok(device) => device,
-                    Err(_) => Device::Cpu,
+                #[cfg(feature = "metal")]
+                {
+                    Device::new_metal(0).unwrap_or(Device::Cpu)
+                }
+                #[cfg(not(feature = "metal"))]
+                {
+                    Device::cuda_if_available(0).unwrap_or(Device::Cpu)
                 }
             } else {
                 Device::Cpu
@@ -159,17 +181,26 @@ impl CandleLLMProvider {
             // Download model and tokenizer
             let (model_path, tokenizer_path) = Self::download_model_and_tokenizer(&config).await?;
 
-            // Load tokenizer
             let tokenizer = Tokenizer::from_file(&tokenizer_path)
                 .map_err(|e| HeliosError::LLMError(format!("Failed to load tokenizer: {}", e)))?;
 
-            // Load model from GGUF
             let mut file = std::fs::File::open(&model_path)
                 .map_err(|e| HeliosError::LLMError(format!("Failed to open model file: {}", e)))?;
             let model_content = gguf_file::Content::read(&mut file)
                 .map_err(|e| HeliosError::LLMError(format!("Failed to read GGUF file: {}", e)))?;
-            let model = Qwen2Model::from_gguf(model_content, &mut file, &device)
-                .map_err(|e| HeliosError::LLMError(format!("Failed to load model: {}", e)))?;
+            
+            let model = match model_type {
+                ModelType::Llama | ModelType::Llama2 => {
+                    let m = LlamaModel::from_gguf(model_content, &mut file, &device)
+                        .map_err(|e| HeliosError::LLMError(format!("Failed to load Llama model: {}", e)))?;
+                    ModelWrapper::Llama(m)
+                }
+                _ => {
+                    let m = Qwen2Model::from_gguf(model_content, &mut file, &device)
+                        .map_err(|e| HeliosError::LLMError(format!("Failed to load Qwen model: {}", e)))?;
+                    ModelWrapper::Qwen2(m)
+                }
+            };
 
             Ok(Self {
                 config,
@@ -273,6 +304,35 @@ impl CandleLLMProvider {
         None
     }
 
+    /// Find tokenizer for a model by searching sibling directories
+    fn find_tokenizer_for_model(cache_dir: &PathBuf, repo: &str) -> Option<PathBuf> {
+        // Extract model name from repo (e.g., "Llama-3.2-3B-Instruct" from "lmstudio-community/Llama-3.2-3B-Instruct-GGUF")
+        let model_name = repo.split('/').last()?
+            .trim_end_matches("-GGUF")
+            .trim_end_matches("-gguf");
+        
+        // Search for tokenizer.json in directories containing the model name
+        if let Ok(entries) = std::fs::read_dir(cache_dir) {
+            for org_entry in entries.flatten() {
+                if !org_entry.path().is_dir() {
+                    continue;
+                }
+                if let Ok(model_entries) = std::fs::read_dir(org_entry.path()) {
+                    for model_entry in model_entries.flatten() {
+                        let dir_name = model_entry.file_name().to_string_lossy().to_string();
+                        if dir_name.contains(model_name) {
+                            let tokenizer_path = model_entry.path().join("tokenizer.json");
+                            if tokenizer_path.exists() {
+                                return Some(tokenizer_path);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
+
     /// Find model and tokenizer in local HuggingFace cache
     fn find_model_in_cache(repo: &str, model_file: &str) -> Option<(PathBuf, PathBuf)> {
         // Get HuggingFace cache directory
@@ -282,6 +342,21 @@ impl CandleLLMProvider {
                 let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
                 PathBuf::from(home).join(".cache").join("huggingface")
             });
+
+        // First check: Direct path in HF_HOME/repo/ (LM Studio format)
+        let direct_model_path = cache_dir.join(repo).join(model_file);
+        let direct_tokenizer_path = cache_dir.join(repo).join("tokenizer.json");
+        if direct_model_path.exists() {
+            // Model found, now find tokenizer
+            let tokenizer_path = if direct_tokenizer_path.exists() {
+                direct_tokenizer_path
+            } else {
+                // For GGUF repos, try to find tokenizer in base model repo
+                // e.g., lmstudio-community/Llama-3.2-3B-Instruct-GGUF -> mlx-community/Llama-3.2-3B-Instruct-4bit
+                Self::find_tokenizer_for_model(&cache_dir, repo)?
+            };
+            return Some((direct_model_path, tokenizer_path));
+        }
 
         let hub_dir = cache_dir.join("hub");
 
@@ -365,33 +440,37 @@ impl CandleLLMProvider {
         formatted
     }
 
-    /// Format messages for Llama models
+    /// Format messages for Llama 3 models
     fn format_llama_messages(&self, messages: &[ChatMessage]) -> String {
         let mut formatted = String::new();
+        formatted.push_str("<|begin_of_text|>");
+        
         for message in messages {
             match message.role {
                 crate::chat::Role::System => {
-                    formatted.push_str("[INST] <<SYS>>\n");
+                    formatted.push_str("<|start_header_id|>system<|end_header_id|>\n\n");
                     formatted.push_str(&message.content);
-                    formatted.push_str("\n<</SYS>>\n\n");
+                    formatted.push_str("<|eot_id|>");
                 }
                 crate::chat::Role::User => {
-                    if !formatted.is_empty() && !formatted.ends_with("[INST] ") {
-                        formatted.push_str("[INST] ");
-                    }
+                    formatted.push_str("<|start_header_id|>user<|end_header_id|>\n\n");
                     formatted.push_str(&message.content);
-                    formatted.push_str(" [/INST] ");
+                    formatted.push_str("<|eot_id|>");
                 }
                 crate::chat::Role::Assistant => {
+                    formatted.push_str("<|start_header_id|>assistant<|end_header_id|>\n\n");
                     formatted.push_str(&message.content);
-                    formatted.push_str(" </s><s>[INST] ");
+                    formatted.push_str("<|eot_id|>");
                 }
                 crate::chat::Role::Tool => {
+                    formatted.push_str("<|start_header_id|>tool<|end_header_id|>\n\n");
                     formatted.push_str(&message.content);
-                    formatted.push_str(" </s><s>[INST] ");
+                    formatted.push_str("<|eot_id|>");
                 }
             }
         }
+        // Start assistant response
+        formatted.push_str("<|start_header_id|>assistant<|end_header_id|>\n\n");
         formatted
     }
 
@@ -468,16 +547,73 @@ impl CandleLLMProvider {
     pub async fn inference(&self, prompt: &str, max_tokens: u32) -> Result<String> {
         #[cfg(feature = "candle")]
         {
-            // Implement inference for Qwen models
-            match self.model_type {
-                ModelType::Qwen | ModelType::Qwen2 | ModelType::Qwen3 => {
-                    self.inference_qwen(prompt, max_tokens).await
-                }
-                _ => Err(HeliosError::LLMError(format!(
-                    "Inference not yet implemented for {:?} models",
-                    self.model_type
-                ))),
+            // Tokenize the prompt
+            let tokens = self
+                .tokenizer
+                .encode(prompt, true)
+                .map_err(|e| HeliosError::LLMError(format!("Tokenization error: {}", e)))?
+                .get_ids()
+                .to_vec();
+
+            if tokens.is_empty() {
+                return Err(HeliosError::LLMError("Empty token sequence".to_string()));
             }
+
+            let device = self.device.clone();
+            let tokenizer = self.tokenizer.clone();
+            let model = self.model.clone();
+            let model_type = self.model_type.clone();
+            let max_tokens = max_tokens as usize;
+
+            let result = tokio::task::block_in_place(move || {
+                let mut model = model
+                    .lock()
+                    .map_err(|e| HeliosError::LLMError(format!("Model lock error: {}", e)))?;
+
+                let mut logits_processor = LogitsProcessor::new(299792458, None, None);
+                let mut generated_tokens = tokens.clone();
+                
+                // Process the entire prompt first
+                let input = candle_core::Tensor::new(tokens.as_slice(), &*device)?.unsqueeze(0)?;
+                let logits = model.forward(&input, 0)?;
+                let logits = match logits.dims().len() {
+                    3 => logits.squeeze(0)?.get(logits.dim(1)? - 1)?,
+                    2 => logits.get(logits.dim(0)? - 1)?,
+                    1 => logits,
+                    _ => return Err(HeliosError::LLMError("Unexpected logits shape".to_string())),
+                };
+                let mut next_token = logits_processor.sample(&logits)?;
+                generated_tokens.push(next_token);
+
+                // Then generate token by token
+                for index in 0..max_tokens {
+                    let input = candle_core::Tensor::new(&[next_token], &*device)?.unsqueeze(0)?;
+                    let logits = model.forward(&input, tokens.len() + index)?;
+                    let logits = match logits.dims().len() {
+                        3 => logits.squeeze(0)?.squeeze(0)?,
+                        2 => logits.squeeze(0)?,
+                        1 => logits,
+                        _ => return Err(HeliosError::LLMError("Unexpected logits shape".to_string())),
+                    };
+                    next_token = logits_processor.sample(&logits)?;
+                    generated_tokens.push(next_token);
+
+                    // Check for EOS tokens
+                    if next_token == 128001 || next_token == 128008 || next_token == 128009 {
+                        break;
+                    }
+                }
+
+                // Decode the generated tokens (skip prompt tokens)
+                let output_tokens = &generated_tokens[tokens.len()..];
+                let output = tokenizer
+                    .decode(output_tokens, true)
+                    .map_err(|e| HeliosError::LLMError(format!("Decode error: {}", e)))?;
+
+                Ok(output)
+            });
+
+            result
         }
 
         #[cfg(not(feature = "candle"))]
@@ -486,81 +622,6 @@ impl CandleLLMProvider {
                 "Candle feature is not enabled".to_string(),
             ))
         }
-    }
-
-    /// Inference for Qwen models
-    #[cfg(feature = "candle")]
-    async fn inference_qwen(&self, prompt: &str, max_tokens: u32) -> Result<String> {
-        // Tokenize the prompt
-        let tokens = self
-            .tokenizer
-            .encode(prompt, true)
-            .map_err(|e| HeliosError::LLMError(format!("Tokenization error: {}", e)))?
-            .get_ids()
-            .to_vec();
-
-        if tokens.is_empty() {
-            return Err(HeliosError::LLMError("Empty token sequence".to_string()));
-        }
-
-        // Run inference in a blocking operation
-        let device = self.device.clone();
-        let tokenizer = self.tokenizer.clone();
-        let model = self.model.clone();
-        let max_tokens = max_tokens as usize;
-
-        let result = tokio::task::block_in_place(move || {
-            let mut model = model
-                .lock()
-                .map_err(|e| HeliosError::LLMError(format!("Model lock error: {}", e)))?;
-
-            // Create logits processor
-            let mut logits_processor = LogitsProcessor::new(299792458, None, None);
-
-            // Generate tokens
-            let mut generated_tokens = tokens.clone();
-            let mut next_token = *generated_tokens.last().unwrap();
-
-            for index in 0..max_tokens {
-                // Create input tensor with just the next token (autoregressive)
-                let input = candle_core::Tensor::new(&[next_token], &*device)?.unsqueeze(0)?;
-
-                // Forward pass - position is the current index
-                let logits = model.forward(&input, index)?;
-                let logits = logits.squeeze(0)?;
-
-                // Sample next token
-                next_token = logits_processor.sample(&logits)?;
-
-                generated_tokens.push(next_token);
-
-                // Check for end tokens
-                if let Some(im_end) = tokenizer.token_to_id("<|im_end|>") {
-                    if next_token == im_end {
-                        break;
-                    }
-                }
-                if let Some(eot) = tokenizer.token_to_id("<|endoftext|>") {
-                    if next_token == eot {
-                        break;
-                    }
-                }
-                // Also break on newline or common stop sequences
-                if next_token == tokenizer.token_to_id("\n").unwrap_or(0) {
-                    break;
-                }
-            }
-
-            // Decode the generated tokens (skip prompt tokens)
-            let output_tokens = &generated_tokens[tokens.len()..];
-            let output = tokenizer
-                .decode(output_tokens, true)
-                .map_err(|e| HeliosError::LLMError(format!("Decode error: {}", e)))?;
-
-            Ok(output)
-        });
-
-        result
     }
 }
 

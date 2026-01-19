@@ -243,26 +243,57 @@ impl ServerState {
 ///
 /// A `Result` that resolves when the server shuts down.
 pub async fn start_server(config: Config, address: &str) -> Result<()> {
-    #[cfg(feature = "local")]
+    #[cfg(all(feature = "candle", feature = "local"))]
+    let provider_type = if let Some(candle_config) = config.candle.clone() {
+        LLMProviderType::Candle(candle_config)
+    } else if let Some(local_config) = config.local.clone() {
+        LLMProviderType::Local(local_config)
+    } else {
+        LLMProviderType::Remote(config.llm.clone())
+    };
+
+    #[cfg(all(feature = "candle", not(feature = "local")))]
+    let provider_type = if let Some(candle_config) = config.candle.clone() {
+        LLMProviderType::Candle(candle_config)
+    } else {
+        LLMProviderType::Remote(config.llm.clone())
+    };
+
+    #[cfg(all(feature = "local", not(feature = "candle")))]
     let provider_type = if let Some(local_config) = config.local.clone() {
         LLMProviderType::Local(local_config)
     } else {
         LLMProviderType::Remote(config.llm.clone())
     };
 
-    #[cfg(not(feature = "local"))]
+    #[cfg(not(any(feature = "local", feature = "candle")))]
     let provider_type = LLMProviderType::Remote(config.llm.clone());
 
     let llm_client = LLMClient::new(provider_type).await?;
 
-    #[cfg(feature = "local")]
+    #[cfg(all(feature = "candle", feature = "local"))]
+    let model_name = config
+        .candle
+        .as_ref()
+        .map(|c| c.huggingface_repo.clone())
+        .or_else(|| config.local.as_ref().map(|_| "local-model".to_string()))
+        .unwrap_or_else(|| config.llm.model_name.clone());
+
+    #[cfg(all(feature = "candle", not(feature = "local")))]
+    let model_name = config
+        .candle
+        .as_ref()
+        .map(|c| c.huggingface_repo.clone())
+        .unwrap_or_else(|| config.llm.model_name.clone());
+
+    #[cfg(all(feature = "local", not(feature = "candle")))]
     let model_name = config
         .local
         .as_ref()
         .map(|_| "local-model".to_string())
         .unwrap_or_else(|| config.llm.model_name.clone());
 
-    #[cfg(not(feature = "local"))]
+    #[cfg(not(any(feature = "local", feature = "candle")))]
     let model_name = config.llm.model_name.clone();
 
     let state = ServerState::with_llm_client(llm_client, model_name);
@@ -340,26 +371,57 @@ pub async fn start_server_with_custom_endpoints(
     address: &str,
     custom_endpoints: Option<CustomEndpointsConfig>,
 ) -> Result<()> {
-    #[cfg(feature = "local")]
+    #[cfg(all(feature = "candle", feature = "local"))]
+    let provider_type = if let Some(candle_config) = config.candle.clone() {
+        LLMProviderType::Candle(candle_config)
+    } else if let Some(local_config) = config.local.clone() {
+        LLMProviderType::Local(local_config)
+    } else {
+        LLMProviderType::Remote(config.llm.clone())
+    };
+
+    #[cfg(all(feature = "candle", not(feature = "local")))]
+    let provider_type = if let Some(candle_config) = config.candle.clone() {
+        LLMProviderType::Candle(candle_config)
+    } else {
+        LLMProviderType::Remote(config.llm.clone())
+    };
+
+    #[cfg(all(feature = "local", not(feature = "candle")))]
     let provider_type = if let Some(local_config) = config.local.clone() {
         LLMProviderType::Local(local_config)
     } else {
         LLMProviderType::Remote(config.llm.clone())
     };
 
-    #[cfg(not(feature = "local"))]
+    #[cfg(not(any(feature = "local", feature = "candle")))]
     let provider_type = LLMProviderType::Remote(config.llm.clone());
 
     let llm_client = LLMClient::new(provider_type).await?;
 
-    #[cfg(feature = "local")]
+    #[cfg(all(feature = "candle", feature = "local"))]
+    let model_name = config
+        .candle
+        .as_ref()
+        .map(|c| c.huggingface_repo.clone())
+        .or_else(|| config.local.as_ref().map(|_| "local-model".to_string()))
+        .unwrap_or_else(|| config.llm.model_name.clone());
+
+    #[cfg(all(feature = "candle", not(feature = "local")))]
+    let model_name = config
+        .candle
+        .as_ref()
+        .map(|c| c.huggingface_repo.clone())
+        .unwrap_or_else(|| config.llm.model_name.clone());
+
+    #[cfg(all(feature = "local", not(feature = "candle")))]
     let model_name = config
         .local
         .as_ref()
         .map(|_| "local-model".to_string())
         .unwrap_or_else(|| config.llm.model_name.clone());
 
-    #[cfg(not(feature = "local"))]
+    #[cfg(not(any(feature = "local", feature = "candle")))]
     let model_name = config.llm.model_name.clone();
 
     let state = ServerState::with_llm_client(llm_client, model_name);

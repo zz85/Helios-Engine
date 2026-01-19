@@ -59,3 +59,4 @@ walkdir = "2.4"
 default = []
 local = ["libc", "llama-cpp-2"]
 candle = ["candle-core", "candle-transformers", "candle-nn", "tokenizers", "hf-hub"]
+metal = ["candle", "candle-core/metal", "candle-nn/metal", "candle-transformers/metal"]

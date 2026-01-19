@@ -1,0 +1,13 @@
+[llm]
+model_name = "gpt-3.5-turbo"
+base_url = "https://api.openai.com/v1"
+api_key = "your-api-key-here"
+temperature = 0.7
+max_tokens = 2048
+
+[local]
+huggingface_repo = "unsloth/Llama-3.2-3B-Instruct-GGUF"
+model_file = "Llama-3.2-3B-Instruct-Q4_K_S.gguf"
+context_size = 32768
+temperature = 0.7
+max_tokens = 2048
