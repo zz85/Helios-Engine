@@ -299,6 +299,7 @@ fn restore_stderr(stderr_backup: i32) {
 pub struct LocalLLMProvider {
     model: Arc<LlamaModel>,
     backend: Arc<LlamaBackend>,
+    repo_name: String,
 }
 
 #[cfg(feature = "local")]
@@ -342,6 +343,7 @@ impl LocalLLMProvider {
         Ok(Self {
             model: Arc::new(model),
             backend: Arc::new(backend),
+            repo_name: config.huggingface_repo.clone(),
         })
     }
 
@@ -445,6 +447,112 @@ impl LocalLLMProvider {
         }
 
         None
+    }
+
+    /// Detects if this is a GPT-OSS model based on repo name
+    fn is_gpt_oss(&self) -> bool {
+        let name = self.repo_name.to_lowercase();
+        name.contains("gpt-oss") || name.contains("gptoss")
+    }
+
+    /// Formats messages for GPT-OSS Harmony format
+    fn format_harmony_messages(&self, messages: &[ChatMessage]) -> String {
+        // GPT-OSS models may work better with simpler ChatML-style format
+        // The special tokens need to be in the vocabulary
+        let mut formatted = String::new();
+        
+        for message in messages {
+            match message.role {
+                crate::chat::Role::System => {
+                    formatted.push_str("<|im_start|>system\n");
+                    formatted.push_str(&message.content);
+                    formatted.push_str("<|im_end|>\n");
+                }
+                crate::chat::Role::User => {
+                    formatted.push_str("<|im_start|>user\n");
+                    formatted.push_str(&message.content);
+                    formatted.push_str("<|im_end|>\n");
+                }
+                crate::chat::Role::Assistant => {
+                    formatted.push_str("<|im_start|>assistant\n");
+                    formatted.push_str(&message.content);
+                    formatted.push_str("<|im_end|>\n");
+                }
+                crate::chat::Role::Tool => {
+                    formatted.push_str("<|im_start|>tool\n");
+                    formatted.push_str(&message.content);
+                    formatted.push_str("<|im_end|>\n");
+                }
+            }
+        }
+        
+        formatted.push_str("<|im_start|>assistant\n");
+        formatted
+    }
+
+    /// Extracts final channel content from GPT-OSS Harmony output
+    fn extract_harmony_final(output: &str) -> String {
+        // The model outputs reasoning then the answer
+        // Remove leading "0\n" artifact if present
+        let output = output.trim_start_matches(|c: char| c == '0' || c == '\n' || c.is_whitespace());
+        
+        // Look for Harmony format markers first
+        if let Some(start) = output.find("<|channel|>final<|message|>") {
+            let content_start = start + "<|channel|>final<|message|>".len();
+            let content = &output[content_start..];
+            if let Some(end) = content.find("<|return|>").or_else(|| content.find("<|end|>")) {
+                return content[..end].trim().to_string();
+            }
+            return content.trim().to_string();
+        }
+        
+        // GPT-OSS often ends with patterns like:
+        // "So respond with X" or "correct answer: X" or just "X."
+        // Try to extract the final answer
+        
+        // Look for the last occurrence of answer-indicating phrases
+        let output_lower = output.to_lowercase();
+        let mut best_answer: Option<String> = None;
+        
+        let patterns = [
+            "correct answer:",
+            "the answer:",
+            "answer is",
+            "respond with",
+            "so respond",
+            "just give",
+        ];
+        
+        for pattern in patterns {
+            if let Some(pos) = output_lower.rfind(pattern) {
+                let after = &output[pos + pattern.len()..];
+                let answer = after
+                    .trim()
+                    .trim_start_matches(|c: char| c == ':' || c == ' ')
+                    .trim_matches('"')
+                    .split(|c: char| c == '.' || c == '\n')
+                    .next()
+                    .unwrap_or("")
+                    .trim()
+                    .trim_matches('"');
+                if !answer.is_empty() && answer.len() < 500 {
+                    best_answer = Some(answer.to_string());
+                    break;
+                }
+            }
+        }
+        
+        if let Some(answer) = best_answer {
+            return answer;
+        }
+        
+        // Fallback: return cleaned output
+        output
+            .replace("<|return|>", "")
+            .replace("<|end|>", "")
+            .replace("<|call|>", "")
+            .trim()
+            .to_string()
     }
 
     /// Formats a list of messages into a single string.
@@ -721,7 +829,14 @@ impl LLMProvider for LocalLLMProvider {
     }
 
     async fn generate(&self, request: LLMRequest) -> Result<LLMResponse> {
-        let prompt = self.format_messages(&request.messages);
+        let is_gpt_oss = self.is_gpt_oss();
+        tracing::debug!("is_gpt_oss: {}, repo: {}", is_gpt_oss, self.repo_name);
+        
+        let prompt = if is_gpt_oss {
+            self.format_harmony_messages(&request.messages)
+        } else {
+            self.format_messages(&request.messages)
+        };
 
         // Suppress output during inference in offline mode
         let (stdout_backup, stderr_backup) = suppress_output();
@@ -766,8 +881,11 @@ impl LLMProvider for LocalLLMProvider {
 
             // Generate response tokens
             let mut generated_text = String::new();
-            let max_new_tokens = 512; // Increased limit for better responses
-            let mut next_pos = tokens.len() as i32; // Start after the prompt tokens
+            let max_new_tokens = 512;
+            let mut next_pos = tokens.len() as i32;
+            
+            // GPT-OSS stop tokens: <|return|>=200002, <|end|>=200007, <|call|>=200012
+            let gpt_oss_stop_tokens: Vec<i32> = vec![200002, 200007, 200012];
 
             for _ in 0..max_new_tokens {
                 // Get logits from the last decoded position (get_logits returns logits for the last token)
@@ -786,6 +904,11 @@ impl LLMProvider for LocalLLMProvider {
 
                 // Check for end of sequence
                 if token == context.model.token_eos() {
+                    break;
+                }
+                
+                // Check for GPT-OSS stop tokens
+                if is_gpt_oss && gpt_oss_stop_tokens.contains(&token.0) {
                     break;
                 }
 
@@ -825,6 +948,13 @@ impl LLMProvider for LocalLLMProvider {
         // Restore output after inference completes
         restore_output(stdout_backup, stderr_backup);
 
+        // Post-process GPT-OSS output to extract final channel content
+        let final_content = if is_gpt_oss {
+            Self::extract_harmony_final(&result)
+        } else {
+            result
+        };
+
         let response = LLMResponse {
             id: format!("local-{}", chrono::Utc::now().timestamp()),
             object: "chat.completion".to_string(),
@@ -834,7 +964,7 @@ impl LLMProvider for LocalLLMProvider {
                 index: 0,
                 message: ChatMessage {
                     role: crate::chat::Role::Assistant,
-                    content: result,
+                    content: final_content,
                     name: None,
                     tool_calls: None,
                     tool_call_id: None,
@@ -842,9 +972,9 @@ impl LLMProvider for LocalLLMProvider {
                 finish_reason: Some("stop".to_string()),
             }],
             usage: Usage {
-                prompt_tokens: 0,     // TODO: Calculate actual token count
-                completion_tokens: 0, // TODO: Calculate actual token count
-                total_tokens: 0,      // TODO: Calculate actual token count
+                prompt_tokens: 0,
+                completion_tokens: 0,
+                total_tokens: 0,
             },
         };
 
@@ -866,7 +996,12 @@ impl LocalLLMProvider {
     where
         F: FnMut(&str) + Send,
     {
-        let prompt = self.format_messages(&messages);
+        let is_gpt_oss = self.is_gpt_oss();
+        let prompt = if is_gpt_oss {
+            self.format_harmony_messages(&messages)
+        } else {
+            self.format_messages(&messages)
+        };
 
         // Suppress only stderr so llama.cpp context logs are hidden but stdout streaming remains visible
         let stderr_backup = suppress_stderr();
@@ -916,6 +1051,9 @@ impl LocalLLMProvider {
             let mut generated_text = String::new();
             let max_new_tokens = 512;
             let mut next_pos = tokens.len() as i32;
+            
+            // GPT-OSS stop tokens: <|return|>=200002, <|end|>=200007, <|call|>=200012
+            let gpt_oss_stop_tokens: Vec<i32> = vec![200002, 200007, 200012];
 
             for _ in 0..max_new_tokens {
                 let logits = context.get_logits();
@@ -933,6 +1071,11 @@ impl LocalLLMProvider {
 
                 // Check for end of sequence
                 if token == context.model.token_eos() {
+                    break;
+                }
+                
+                // Check for GPT-OSS stop tokens
+                if is_gpt_oss && gpt_oss_stop_tokens.contains(&token.0) {
                     break;
                 }
 
@@ -1043,9 +1186,16 @@ impl LocalLLMProvider {
         // Restore stderr after generation completes
         restore_stderr(stderr_backup);
 
+        // Post-process GPT-OSS output to extract final answer
+        let final_content = if is_gpt_oss {
+            Self::extract_harmony_final(&result)
+        } else {
+            result
+        };
+
         Ok(ChatMessage {
             role: crate::chat::Role::Assistant,
-            content: result,
+            content: final_content,
             name: None,
             tool_calls: None,
             tool_call_id: None,
