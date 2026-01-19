@@ -1153,39 +1153,15 @@ impl LLMClient {
                 }
             }
             #[cfg(feature = "candle")]
-            LLMProviderType::Candle(config) => {
-                // For Candle, use non-streaming generate and call on_chunk with full response
-                let (model_name, default_temperature, default_max_tokens) = (
-                    config.huggingface_repo.clone(),
-                    config.temperature,
-                    config.max_tokens,
-                );
-
-                let request = LLMRequest {
-                    model: model_name,
-                    messages,
-                    temperature: temperature.or(Some(default_temperature)),
-                    max_tokens: max_tokens.or(Some(default_max_tokens)),
-                    tools: tools.clone(),
-                    tool_choice: if tools.is_some() {
-                        Some("auto".to_string())
-                    } else {
-                        None
-                    },
-                    stream: None,
-                    stop,
-                };
-
-                let response = self.provider.generate(request).await?;
-                if let Some(choice) = response.choices.first() {
-                    on_chunk(&choice.message.content);
+            LLMProviderType::Candle(_) => {
+                if let Some(provider) = self.provider.as_any().downcast_ref::<CandleLLMProvider>() {
+                    let prompt = provider.format_messages(&messages);
+                    let max_tokens = max_tokens.unwrap_or(provider.config.max_tokens);
+                    let content = provider.inference_stream(&prompt, max_tokens, &mut on_chunk).await?;
+                    Ok(ChatMessage::assistant(content))
+                } else {
+                    Err(HeliosError::AgentError("Provider type mismatch".into()))
                 }
-                response
-                    .choices
-                    .into_iter()
-                    .next()
-                    .map(|choice| choice.message)
-                    .ok_or_else(|| HeliosError::LLMError("No response from LLM".to_string()))
             }
         }
     }

@@ -139,7 +139,7 @@ impl TokenOutputStream {
 
 /// Candle LLM Provider for running models locally
 pub struct CandleLLMProvider {
-    config: CandleConfig,
+    pub config: CandleConfig,
     model_type: ModelType,
     #[cfg(feature = "candle")]
     device: Arc<Device>,
@@ -397,7 +397,7 @@ impl CandleLLMProvider {
     }
 
     /// Format messages into a prompt string
-    fn format_messages(&self, messages: &[ChatMessage]) -> String {
+    pub fn format_messages(&self, messages: &[ChatMessage]) -> String {
         match self.model_type {
             ModelType::Qwen | ModelType::Qwen2 | ModelType::Qwen3 => {
                 self.format_qwen_messages(messages)
@@ -621,6 +621,94 @@ impl CandleLLMProvider {
             Err(HeliosError::LLMError(
                 "Candle feature is not enabled".to_string(),
             ))
+        }
+    }
+
+    /// Run streaming inference on the model
+    pub async fn inference_stream<F>(&self, prompt: &str, max_tokens: u32, mut on_token: F) -> Result<String>
+    where
+        F: FnMut(&str) + Send,
+    {
+        #[cfg(feature = "candle")]
+        {
+            let tokens = self
+                .tokenizer
+                .encode(prompt, true)
+                .map_err(|e| HeliosError::LLMError(format!("Tokenization error: {}", e)))?
+                .get_ids()
+                .to_vec();
+
+            if tokens.is_empty() {
+                return Err(HeliosError::LLMError("Empty token sequence".to_string()));
+            }
+
+            let device = self.device.clone();
+            let tokenizer = self.tokenizer.clone();
+            let model = self.model.clone();
+            let max_tokens = max_tokens as usize;
+
+            let (tx, rx) = std::sync::mpsc::channel::<String>();
+
+            let handle = std::thread::spawn(move || -> Result<String> {
+                let mut model = model
+                    .lock()
+                    .map_err(|e| HeliosError::LLMError(format!("Model lock error: {}", e)))?;
+
+                let mut logits_processor = LogitsProcessor::new(299792458, None, None);
+                let mut output = String::new();
+
+                // Process prompt
+                let input = candle_core::Tensor::new(tokens.as_slice(), &*device)?.unsqueeze(0)?;
+                let logits = model.forward(&input, 0)?;
+                let logits = match logits.dims().len() {
+                    3 => logits.squeeze(0)?.get(logits.dim(1)? - 1)?,
+                    2 => logits.get(logits.dim(0)? - 1)?,
+                    1 => logits,
+                    _ => return Err(HeliosError::LLMError("Unexpected logits shape".to_string())),
+                };
+                let mut next_token = logits_processor.sample(&logits)?;
+
+                // Decode and send first token
+                if let Ok(text) = tokenizer.decode(&[next_token], true) {
+                    let _ = tx.send(text.clone());
+                    output.push_str(&text);
+                }
+
+                // Generate remaining tokens
+                for index in 0..max_tokens {
+                    if next_token == 128001 || next_token == 128008 || next_token == 128009 {
+                        break;
+                    }
+                    let input = candle_core::Tensor::new(&[next_token], &*device)?.unsqueeze(0)?;
+                    let logits = model.forward(&input, tokens.len() + index)?;
+                    let logits = match logits.dims().len() {
+                        3 => logits.squeeze(0)?.squeeze(0)?,
+                        2 => logits.squeeze(0)?,
+                        1 => logits,
+                        _ => return Err(HeliosError::LLMError("Unexpected logits shape".to_string())),
+                    };
+                    next_token = logits_processor.sample(&logits)?;
+
+                    if let Ok(text) = tokenizer.decode(&[next_token], true) {
+                        let _ = tx.send(text.clone());
+                        output.push_str(&text);
+                    }
+                }
+                Ok(output)
+            });
+
+            // Receive tokens and call callback
+            while let Ok(text) = rx.recv() {
+                on_token(&text);
+            }
+
+            handle.join().map_err(|_| HeliosError::LLMError("Thread panic".to_string()))?
+        }
+
+        #[cfg(not(feature = "candle"))]
+        {
+            let _ = (prompt, max_tokens, on_token);
+            Err(HeliosError::LLMError("Candle feature is not enabled".to_string()))
         }
     }
 }
