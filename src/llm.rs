@@ -305,6 +305,9 @@ pub struct LocalLLMProvider {
 impl LocalLLMProvider {
     /// Creates a new `LocalLLMProvider`.
     pub async fn new(config: LocalConfig) -> Result<Self> {
+        // Print model info in debug mode
+        tracing::debug!("Loading local model: {}/{}", config.huggingface_repo, config.model_file);
+        
         // Suppress verbose output during model loading in offline mode
         let (stdout_backup, stderr_backup) = suppress_output();
 
@@ -320,6 +323,8 @@ impl LocalLLMProvider {
             e
         })?;
 
+        tracing::debug!("Model path: {}", model_path.display());
+
         // Load the model
         let model_params = LlamaModelParams::default().with_n_gpu_layers(99); // Use GPU if available
 
@@ -331,6 +336,8 @@ impl LocalLLMProvider {
 
         // Restore output
         restore_output(stdout_backup, stderr_backup);
+        
+        tracing::debug!("Model loaded successfully");
 
         Ok(Self {
             model: Arc::new(model),
@@ -397,6 +404,12 @@ impl LocalLLMProvider {
                     .join(".cache")
                     .join("huggingface")
             });
+
+        // First check: Direct path in HF_HOME/repo/model_file (LM Studio format)
+        let direct_path = cache_dir.join(repo).join(model_file);
+        if direct_path.exists() {
+            return Some(direct_path);
+        }
 
         let hub_dir = cache_dir.join("hub");
 
@@ -927,6 +940,18 @@ impl LocalLLMProvider {
                 match context.model.token_to_str(token, Special::Plaintext) {
                     Ok(text) => {
                         generated_text.push_str(&text);
+                        
+                        // Check for stop sequences after adding the token
+                        if generated_text.contains("<|im_end|>") || generated_text.contains("<|endoftext|>") {
+                            // Remove the stop sequence and everything after it
+                            if let Some(pos) = generated_text.find("<|im_end|>") {
+                                generated_text.truncate(pos);
+                            } else if let Some(pos) = generated_text.find("<|endoftext|>") {
+                                generated_text.truncate(pos);
+                            }
+                            break;
+                        }
+                        
                         // Send token through channel; stop if receiver is dropped
                         if tx.send(text).is_err() {
                             break;
@@ -955,9 +980,51 @@ impl LocalLLMProvider {
             Ok::<String, HeliosError>(generated_text)
         });
 
-        // Receive and process tokens as they arrive
+        // Receive and process tokens as they arrive with buffering to detect stop sequences
+        let mut buffer = String::new();
+        const STOP_SEQ_MAX_LEN: usize = 15; // Length of "<|endoftext|>" or "<|im_end|>"
+        
         while let Some(token) = rx.recv().await {
-            on_chunk(&token);
+            buffer.push_str(&token);
+            
+            // Check if buffer contains complete stop sequence
+            if buffer.contains("<|im_end|>") || buffer.contains("<|endoftext|>") {
+                // Output everything before the stop sequence
+                if let Some(pos) = buffer.find("<|im_end|>") {
+                    if pos > 0 {
+                        on_chunk(&buffer[..pos]);
+                    }
+                } else if let Some(pos) = buffer.find("<|endoftext|>") {
+                    if pos > 0 {
+                        on_chunk(&buffer[..pos]);
+                    }
+                }
+                break;
+            }
+            
+            // Stream output but keep a small buffer for stop sequence detection
+            if buffer.len() > STOP_SEQ_MAX_LEN {
+                let flush_len = buffer.len() - STOP_SEQ_MAX_LEN;
+                on_chunk(&buffer[..flush_len]);
+                buffer.drain(..flush_len);
+            }
+        }
+        
+        // Flush remaining buffer, checking for partial stop sequences
+        if !buffer.is_empty() {
+            // Check if buffer ends with partial stop sequence
+            let mut has_partial = false;
+            for i in 1..=buffer.len().min(STOP_SEQ_MAX_LEN) {
+                let suffix = &buffer[buffer.len() - i..];
+                if "<|im_end|>".starts_with(suffix) || "<|endoftext|>".starts_with(suffix) {
+                    has_partial = true;
+                    break;
+                }
+            }
+            
+            if !has_partial {
+                on_chunk(&buffer);
+            }
         }
 
         // Wait for generation to complete and get the result
