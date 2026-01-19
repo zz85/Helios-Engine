@@ -905,31 +905,37 @@ fn stream_chat_completion(
     let created = chrono::Utc::now().timestamp() as u64;
 
     tokio::spawn(async move {
-        let on_chunk = |chunk: &str| {
-            let event = Event::default()
-                .json_data(serde_json::json!({
-                    "id": completion_id,
-                    "object": "chat.completion.chunk",
-                    "created": created,
-                    "model": model,
-                    "choices": [{
-                        "index": 0,
-                        "delta": {
-                            "content": chunk
-                        },
-                        "finish_reason": null
-                    }]
-                }))
-                .unwrap();
-            let _ = tx.try_send(Ok(event));
+        let on_chunk = {
+            let tx = tx.clone();
+            let model = model.clone();
+            let completion_id = completion_id.clone();
+            move |chunk: &str| {
+                let event = Event::default()
+                    .json_data(serde_json::json!({
+                        "id": completion_id,
+                        "object": "chat.completion.chunk",
+                        "created": created,
+                        "model": model,
+                        "choices": [{
+                            "index": 0,
+                            "delta": {
+                                "content": chunk
+                            },
+                            "finish_reason": null
+                        }]
+                    }))
+                    .unwrap();
+                let _ = tx.try_send(Ok(event));
+            }
         };
 
         if let Some(agent) = &state.agent {
             // Use agent for true streaming response with full conversation history
             let mut agent = agent.write().await;
+            let cb = on_chunk.clone();
 
             match agent
-                .chat_stream_with_history(messages, temperature, max_tokens, stop.clone(), on_chunk)
+                .chat_stream_with_history(messages, temperature, max_tokens, stop.clone(), cb)
                 .await
             {
                 Ok(_) => {

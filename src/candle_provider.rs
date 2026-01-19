@@ -647,31 +647,50 @@ impl CandleLLMProvider {
             let model = self.model.clone();
             let max_tokens = max_tokens as usize;
 
-            let (tx, rx) = std::sync::mpsc::channel::<String>();
+            // Channel for streaming tokens
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
 
-            let handle = std::thread::spawn(move || -> Result<String> {
-                let mut model = model
-                    .lock()
-                    .map_err(|e| HeliosError::LLMError(format!("Model lock error: {}", e)))?;
+            // Spawn blocking work
+            std::thread::spawn(move || {
+                let mut model = match model.lock() {
+                    Ok(m) => m,
+                    Err(_) => return,
+                };
 
                 let mut logits_processor = LogitsProcessor::new(299792458, None, None);
-                let mut output = String::new();
 
                 // Process prompt
-                let input = candle_core::Tensor::new(tokens.as_slice(), &*device)?.unsqueeze(0)?;
-                let logits = model.forward(&input, 0)?;
-                let logits = match logits.dims().len() {
-                    3 => logits.squeeze(0)?.get(logits.dim(1)? - 1)?,
-                    2 => logits.get(logits.dim(0)? - 1)?,
-                    1 => logits,
-                    _ => return Err(HeliosError::LLMError("Unexpected logits shape".to_string())),
+                let input = match candle_core::Tensor::new(tokens.as_slice(), &*device) {
+                    Ok(t) => match t.unsqueeze(0) {
+                        Ok(t) => t,
+                        Err(_) => return,
+                    },
+                    Err(_) => return,
                 };
-                let mut next_token = logits_processor.sample(&logits)?;
+                let logits = match model.forward(&input, 0) {
+                    Ok(l) => l,
+                    Err(_) => return,
+                };
+                let logits = match logits.dims().len() {
+                    3 => match logits.squeeze(0).and_then(|l| l.get(logits.dim(1).unwrap_or(1) - 1)) {
+                        Ok(l) => l,
+                        Err(_) => return,
+                    },
+                    2 => match logits.get(logits.dim(0).unwrap_or(1) - 1) {
+                        Ok(l) => l,
+                        Err(_) => return,
+                    },
+                    1 => logits,
+                    _ => return,
+                };
+                let mut next_token = match logits_processor.sample(&logits) {
+                    Ok(t) => t,
+                    Err(_) => return,
+                };
 
-                // Decode and send first token
+                // Send first token
                 if let Ok(text) = tokenizer.decode(&[next_token], true) {
-                    let _ = tx.send(text.clone());
-                    output.push_str(&text);
+                    let _ = tx.send(text);
                 }
 
                 // Generate remaining tokens
@@ -679,30 +698,50 @@ impl CandleLLMProvider {
                     if next_token == 128001 || next_token == 128008 || next_token == 128009 {
                         break;
                     }
-                    let input = candle_core::Tensor::new(&[next_token], &*device)?.unsqueeze(0)?;
-                    let logits = model.forward(&input, tokens.len() + index)?;
-                    let logits = match logits.dims().len() {
-                        3 => logits.squeeze(0)?.squeeze(0)?,
-                        2 => logits.squeeze(0)?,
-                        1 => logits,
-                        _ => return Err(HeliosError::LLMError("Unexpected logits shape".to_string())),
+                    let input = match candle_core::Tensor::new(&[next_token], &*device) {
+                        Ok(t) => match t.unsqueeze(0) {
+                            Ok(t) => t,
+                            Err(_) => break,
+                        },
+                        Err(_) => break,
                     };
-                    next_token = logits_processor.sample(&logits)?;
+                    let logits = match model.forward(&input, tokens.len() + index) {
+                        Ok(l) => l,
+                        Err(_) => break,
+                    };
+                    let logits = match logits.dims().len() {
+                        3 => match logits.squeeze(0).and_then(|l| l.squeeze(0)) {
+                            Ok(l) => l,
+                            Err(_) => break,
+                        },
+                        2 => match logits.squeeze(0) {
+                            Ok(l) => l,
+                            Err(_) => break,
+                        },
+                        1 => logits,
+                        _ => break,
+                    };
+                    next_token = match logits_processor.sample(&logits) {
+                        Ok(t) => t,
+                        Err(_) => break,
+                    };
 
                     if let Ok(text) = tokenizer.decode(&[next_token], true) {
-                        let _ = tx.send(text.clone());
-                        output.push_str(&text);
+                        if tx.send(text).is_err() {
+                            break;
+                        }
                     }
                 }
-                Ok(output)
             });
 
-            // Receive tokens and call callback
-            while let Ok(text) = rx.recv() {
+            // Receive and process tokens
+            let mut output = String::new();
+            while let Some(text) = rx.recv().await {
                 on_token(&text);
+                output.push_str(&text);
             }
 
-            handle.join().map_err(|_| HeliosError::LLMError("Thread panic".to_string()))?
+            Ok(output)
         }
 
         #[cfg(not(feature = "candle"))]
